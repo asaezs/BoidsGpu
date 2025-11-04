@@ -7,14 +7,14 @@ import ctypes # <-- Importamos ctypes para la depuración
 
 # --- 1. Constantes ---
 WIDTH, HEIGHT = 1280, 720
-NUM_BOIDS = 10000 
-VIEW_RADIUS = 75.0
+NUM_BOIDS = 500
+VIEW_RADIUS = 30.0
 SEPARATION_DISTANCE = 25.0
-MAX_SPEED = 3.0
+MAX_SPEED = 2.0
 
 # --- 2. Shaders (¡CORREGIDOS!) ---
 
-# --- COMPUTE SHADER (CON ARREGLOS DE DIVISIÓN POR CERO) ---
+# --- COMPUTE SHADER (AJUSTADO PARA MEJOR COMPORTAMIENTO) ---
 COMPUTE_SHADER_SOURCE = """
 #version 430 core
 
@@ -41,6 +41,7 @@ uniform vec2 u_mouse_pos;
 layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 vec2 wrap_boundaries(vec2 pos) {
+    // El "wrapping" será nuestro "seguro" por si la fuerza falla
     if (pos.x < 0) { pos.x = u_width; }
     if (pos.x > u_width) { pos.x = 0; }
     if (pos.y < 0) { pos.y = u_height; }
@@ -60,18 +61,17 @@ void main() {
     vec2 coh_force = vec2(0.0);
     float count = 0.0;
 
+    // ... (El bucle for de Boids O(N^2) no cambia) ...
     for (int j = 0; j < u_num_boids; j++) {
         if (i == j) continue;
-
+        
         vec2 pos_j = boids_in[j].pos;
         vec2 vel_j = boids_in[j].vel;
-        
         vec2 dist_vec = pos_i - pos_j;
         float dist = length(dist_vec);
 
         if (dist > 0.0 && dist < u_view_radius) {
             count += 1.0;
-            
             if (dist < u_sep_dist) {
                 sep_force += dist_vec / (dist * dist + 1e-6);
             }
@@ -81,41 +81,46 @@ void main() {
     }
 
     if (count > 0.0) {
-        // --- Alineación (¡CORREGIDA!) ---
+        // --- Alineación (Corregida) ---
         ali_force /= count;
         float ali_len = length(ali_force);
-        if (ali_len > 1e-6) { // Solo normalizar si el vector no es (0,0)
+        if (ali_len > 1e-6) {
             ali_force = (ali_force / ali_len) * u_max_speed;
         }
         ali_force = ali_force - vel_i; // Steer
         
-        // --- Cohesión (¡CORREGIDA!) ---
+        // --- Cohesión (Corregida) ---
         coh_force /= count;
         vec2 vec_to_center = coh_force - pos_i;
         float coh_len = length(vec_to_center);
-        if (coh_len > 1e-6) { // Solo normalizar si el vector no es (0,0)
+        if (coh_len > 1e-6) {
             coh_force = (coh_force / coh_len) * u_max_speed;
         }
         coh_force = coh_force - vel_i; // Steer
 
-        vel_i += (ali_force * 1.0) + (coh_force * 0.5) + (sep_force * 1.5);
+        // --- ¡¡AJUSTE DE PESOS!! ---
+        vel_i += (ali_force * 0.5) + (coh_force * 0.2) + (sep_force * 1.5);
     }
     
     // --- 4ª Regla: Evasión del Ratón ---
     float dist_to_mouse = distance(pos_i, u_mouse_pos);
-    if (dist_to_mouse < 100.0) {
+    if (dist_to_mouse < 150.0) {
         vec2 repel_vec = pos_i - u_mouse_pos;
-        vel_i += (repel_vec / (dist_to_mouse * dist_to_mouse + 1e-6)) * 5.0;
+        vel_i += (repel_vec / (dist_to_mouse * dist_to_mouse + 1e-6)) * 20.0;
     }
 
-    // --- Actualización Final (Corregida) ---
+    // --- Actualización Final ---
+    // Limitamos la velocidad DESPUÉS de aplicar TODAS las fuerzas
     float speed = length(vel_i);
     if (speed > u_max_speed) {
         vel_i = (vel_i / (speed + 1e-6)) * u_max_speed;
     }
     
+    // Aplicamos el movimiento
     pos_i += vel_i;
-    pos_i = wrap_boundaries(pos_i);
+    
+    // El wrapping es solo un seguro
+    pos_i = wrap_boundaries(pos_i); 
     
     boids_out[i].pos = pos_i;
     boids_out[i].vel = vel_i;
@@ -303,6 +308,9 @@ def main():
     vao = glGenVertexArrays(1)
     glfw.set_cursor_pos_callback(window, on_mouse_move)
 
+    global mouse_pos
+    mouse_pos = (-1000.0, -1000.0)
+
     print("Iniciando... Cierra la ventana para salir. Mueve el ratón para repeler.")
     while not glfw.window_should_close(window):
         glfw.poll_events()
@@ -316,6 +324,9 @@ def main():
         glUniform1f(glGetUniformLocation(compute_program, "u_width"), WIDTH)
         glUniform1f(glGetUniformLocation(compute_program, "u_height"), HEIGHT)
         glUniform2f(glGetUniformLocation(compute_program, "u_mouse_pos"), mouse_pos[0], mouse_pos[1])
+
+        glUniform1f(glGetUniformLocation(compute_program, "u_turn_margin"), 100.0) # Margen de 100px
+        glUniform1f(glGetUniformLocation(compute_program, "u_turn_force"), 2.0)  # ¡Una fuerza muy alta!
         
         input_buffer_index = frame_index % 2
         output_buffer_index = (frame_index + 1) % 2
