@@ -3,6 +3,9 @@ from OpenGL.GL import *
 import sys
 import numpy as np
 import math
+from numba import cuda
+
+USE_GPU = True
 
 WIDTH, HEIGHT = 1280, 720
 
@@ -15,6 +18,12 @@ MAX_FORCE = 0.1
 # (N, 2) -> N boids, con 2 coords (x, y)
 positions = np.zeros((NUM_BOIDS, 2), dtype=np.float32) # Float32 para OpenGL
 velocities = np.zeros((NUM_BOIDS, 2), dtype=np.float32)
+
+# Variables GPU
+separation_force = np.zeros((NUM_BOIDS, 2), dtype=np.float32)
+alignment_force = np.zeros((NUM_BOIDS, 2), dtype=np.float32)
+cohesion_force = np.zeros((NUM_BOIDS, 2), dtype=np.float32)
+neighbor_count = np.zeros((NUM_BOIDS, 1), dtype=np.float32)
 
 def init_boids():
     global positions, velocities
@@ -95,6 +104,125 @@ def update_boids_cpu():
         # Wrapping
         wrap_boundaries(i)
 
+# Como el for de update_boids_cpu pero usando la GPU
+@cuda.jit
+def boids_rules_kernel(positions_in, velocities_in, separation_out, alignment_out, cohesion_out, neighbor_count_out,
+                       view_radius, separation_distance):
+    """ Cada hilo de la GPU es responsable de UN solo boid (índice 'i'). """
+    
+    # Esto es como la iteracion del bucle for de la cpu
+    i = cuda.grid(1)
+    
+    # Dentro de los límites
+    if i >= positions_in.shape[0]:
+        return
+
+    s_force_x, s_force_y = 0.0, 0.0
+    a_force_x, a_force_y = 0.0, 0.0
+    c_force_x, c_force_y = 0.0, 0.0
+    count = 0
+
+    # Bucle para cada hilo de la GPU (Boid)
+    for j in range(positions_in.shape[0]):
+        if i == j:
+            continue
+            
+        # Calcular la distancia
+        dist_x = positions_in[i, 0] - positions_in[j, 0]
+        dist_y = positions_in[i, 1] - positions_in[j, 1]
+        distance = math.sqrt(dist_x**2 + dist_y**2)
+
+        # Si entra en rango
+        if distance > 0 and distance < view_radius:
+            count += 1
+            
+            # Separación
+            if distance < separation_distance:
+                s_force_x += dist_x / (distance * distance + 1e-6)
+                s_force_y += dist_y / (distance * distance + 1e-6)
+
+            # Alineación
+            a_force_x += velocities_in[j, 0]
+            a_force_y += velocities_in[j, 1]
+
+            # Cohesión
+            c_force_x += positions_in[j, 0]
+            c_force_y += positions_in[j, 1]
+
+    # Escribir los resultados en la memoria de salida de la GPU
+    separation_out[i, 0] = s_force_x
+    separation_out[i, 1] = s_force_y
+    alignment_out[i, 0] = a_force_x
+    alignment_out[i, 1] = a_force_y
+    cohesion_out[i, 0] = c_force_x
+    cohesion_out[i, 1] = c_force_y
+    neighbor_count_out[i, 0] = count
+
+def update_boids_gpu():
+    global positions, velocities, separation_force, alignment_force, cohesion_force, neighbor_count
+    
+    # 1 hilo por boid
+    threads_per_block = 256
+    blocks_per_grid = (NUM_BOIDS + threads_per_block - 1) // threads_per_block
+
+    # De RAM a VRAM
+    d_positions_in = cuda.to_device(positions)
+    d_velocities_in = cuda.to_device(velocities)
+    
+    # Crear arrays de salida vacíos en GPU
+    d_separation_out = cuda.device_array_like(separation_force)
+    d_alignment_out = cuda.device_array_like(alignment_force)
+    d_cohesion_out = cuda.device_array_like(cohesion_force)
+    d_neighbor_count_out = cuda.device_array_like(neighbor_count)
+
+    # La GPU ahora está haciendo el trabajo O(N^2)
+    boids_rules_kernel[blocks_per_grid, threads_per_block](
+        d_positions_in, d_velocities_in,
+        d_separation_out, d_alignment_out, d_cohesion_out, d_neighbor_count_out,
+        VIEW_RADIUS, SEPARATION_DISTANCE
+    )
+    
+    # Esperar a que la GPU termine
+    cuda.synchronize()
+
+    # VRAM a RAM
+    separation_force = d_separation_out.copy_to_host()
+    alignment_force = d_alignment_out.copy_to_host()
+    cohesion_force = d_cohesion_out.copy_to_host()
+    neighbor_count = d_neighbor_count_out.copy_to_host()
+
+    # Vuelta a la CPU (Reutilizamos el código de la CPU para aplicar las fuerzas)
+    
+    # Evitar división por cero
+    for i in range(NUM_BOIDS):
+        if neighbor_count[i, 0] > 0:
+            count = neighbor_count[i, 0]
+            
+            alignment_force[i] /= count
+            norm = math.sqrt(alignment_force[i, 0]**2 + alignment_force[i, 1]**2)
+            alignment_force[i] = (alignment_force[i] / (norm + 1e-6)) * MAX_SPEED
+            steer_alignment = alignment_force[i] - velocities[i]
+
+            cohesion_force[i] /= count
+            vec_to_center = cohesion_force[i] - positions[i]
+            norm = math.sqrt(vec_to_center[0]**2 + vec_to_center[1]**2)
+            cohesion_force[i] = (vec_to_center / (norm + 1e-6)) * MAX_SPEED
+            steer_cohesion = cohesion_force[i] - velocities[i]
+
+            # Aplicar Fuerzas
+            velocities[i] += (steer_alignment * 1.0)
+            velocities[i] += (steer_cohesion * 0.5)
+            velocities[i] += (separation_force[i] * 1.5)
+
+    # Actualizar
+    for i in range(NUM_BOIDS):
+        speed = math.sqrt(velocities[i, 0]**2 + velocities[i, 1]**2)
+        if speed > MAX_SPEED:
+            velocities[i] = (velocities[i] / speed) * MAX_SPEED
+            
+        positions[i] += velocities[i]
+        wrap_boundaries(i)
+
 def wrap_boundaries(i):
     if positions[i, 0] < 0: positions[i, 0] = WIDTH
     if positions[i, 0] > WIDTH: positions[i, 0] = 0
@@ -143,12 +271,21 @@ def main():
 
     init_boids()
 
+    if USE_GPU and cuda.is_available():
+        print("¡GPU detectada! Usando el kernel de CUDA.")
+        update_function = update_boids_gpu
+        glfw.set_window_title(window, "Simulador de Boids GPU")
+    else:
+        print("GPU no detectada o desactivada. Usando la CPU (lento).")
+        update_function = update_boids_cpu
+        glfw.set_window_title(window, "Simulador de Boids CPU")
+
     print("Iniciando... Cierra la ventana para salir.")
     while not glfw.window_should_close(window):
         
         glfw.poll_events()
 
-        update_boids_cpu()
+        update_function()
         
         glClearColor(0.1, 0.1, 0.15, 1.0)
         
